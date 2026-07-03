@@ -1,0 +1,27 @@
+# Secrets — never commit these
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Databases — order book snapshots, positions, trade log (local data, not code)
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated data files — reproducible from discover_markets.py, not source of truth
+data/football_markets.json
+
+# OS/editor cruft
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
