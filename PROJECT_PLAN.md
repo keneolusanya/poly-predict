@@ -17,6 +17,23 @@ You have both, so use each for what it's better at rather than picking one:
 
 Each day below is tagged with the suggested tool.
 
+## Config — venue, tournament, data source
+
+Single source of truth read by every module (execution, data pipeline,
+signal generator) instead of hardcoding assumptions inline. Create early
+(Day 1), update by hand whenever what you're trading changes (World Cup
+ends → back to club leagues; you relocate → Kalshi instead of Polymarket).
+
+```python
+# config.py
+VENUE = "polymarket"           # or "kalshi"
+TOURNAMENT = "world_cup_2026"  # or "premier_league"
+DATA_SOURCE = "martj42/international_results"  # or football-data.co.uk
+```
+
+This is intentionally static/manual — you always know in advance what
+you're trading, so there's no need for the system to auto-detect it.
+
 ---
 
 ## Day 1 — Plumbing
@@ -26,10 +43,17 @@ Each day below is tagged with the suggested tool.
 2. Deposit $50-100 USDC on Polygon
 3. `pip install -r requirements.txt`
 4. Run `python data/discover_markets.py`
+   - This IS "knowing what football markets are currently tradeable" —
+     it queries Polymarket's Gamma API for active events live right now.
+     No separate market-tracking logic needed; just re-run this whenever
+     you want a current read (e.g. switching from World Cup to club
+     leagues later — same script, adjust the keyword filter below).
    - ✅ Checkpoint: `football_markets.json` exists and has >0 entries
    - ⚠️ If 0 entries: print the raw event titles from `fetch_active_events()`
      before filtering — the keyword list is a guess, adjust it to match
-     what's actually live right now
+     what's actually live right now. For World Cup scope, filter on
+     "world cup" / "fifa" / round names (round of 16, quarter-final, etc.)
+     rather than club league keywords.
 5. Pick one `token_id` from that file, run `python data/check_book.py <token_id>`
    - ✅ Checkpoint: midpoint is between 0 and 1, best bid < best ask, no
      ghost-book warning
@@ -56,18 +80,24 @@ No private key touched yet.
      identically (a sign the poller is failing silently and returning
      cached data)
 
-### 2b. Historical results for model fitting
-1. Pull historical match data (football-data.co.uk CSVs are the easiest —
-   no API key, direct CSV download per league/season)
-   - ⚠️ These CSVs include bookmaker odds columns (B365H, PSH, etc.) —
-     **do not use these as model features.** If Dixon-Coles is trained on
-     data derived from other markets' prices, "my model finds edge vs.
-     Polymarket" becomes circular. Use only date/teams/goals columns.
-2. Get at minimum: date, home team, away team, home goals, away goals,
-   for 3+ seasons of your target league(s)
+### 2b. Historical results for model fitting — World Cup scope
+1. Use the `martj42/international_results` GitHub repo (`results.csv`) —
+   free, no API key, actively maintained through the current tournament.
+   Filter to `tournament == "FIFA World Cup"` (add continental
+   championships/competitive qualifiers if you want more team-strength
+   context beyond just World Cup matches themselves)
+   - ⚠️ Same rule as before: never use market-derived data (odds) as a
+     model feature — this repo doesn't have any, so no risk here, but the
+     rule still applies if you ever add a second source.
+2. Use the `neutral` column — most World Cup matches aren't "home" for
+   either team. Don't apply home-advantage the way a club-league model
+   would; the model should skip/zero out home advantage when neutral=True.
+3. Get at minimum: date, home team, away team, home goals, away goals,
+   neutral flag, tournament, for as much history as the repo has
 3. Normalize team names across seasons (they drift — "Man United" vs
    "Manchester United")
    - ✅ Checkpoint: one clean dataframe/table, no nulls in the four core
+
      columns, team names consistent across all rows
 
 **End of day:** live prices are being logged continuously, and you have
@@ -81,6 +111,9 @@ clean historical match data sitting ready for Day 3.
 1. Implement the Dixon-Coles likelihood: each team gets attack (α) and
    defense (β) strength parameters, goals modeled as Poisson with rates
    `λ_home = α_home * β_away * home_advantage`, `λ_away = α_away * β_home`
+   - ⚠️ **World Cup adjustment:** apply `home_advantage` only when the
+     match's `neutral` flag is False. For neutral=True matches (most WC
+     games), both λ's use `home_advantage = 1` (no boost for either side)
 2. Add the Dixon-Coles correlation adjustment (τ function) for low-score
    outcomes (0-0, 1-0, 0-1, 1-1) — this is the part that's actually
    "Dixon-Coles" rather than a plain independent-Poisson model
@@ -113,9 +146,15 @@ win/draw/loss probabilities, with a validation number you can quote.
    date — this matching logic is fiddly, budget real time for it)
 3. Compute edge: `model_probability - market_implied_probability`
    (market-implied = midpoint or best available price)
-4. **Query live account balance** before every sizing decision (via the
-   CLOB client) — do not size against a static/remembered bankroll
-   number. Your balance changes as trades settle; sizing must track it.
+4. **Query live account balance** before every sizing decision — use
+   Polymarket's Data API (`data-api.polymarket.com`), specifically its
+   positions endpoint, rather than reconstructing balance through the
+   CLOB client. Likely queryable by wallet address with no auth needed
+   for read access, since positions are on-chain/public. Don't size
+   against a static/remembered bankroll number — your balance changes as
+   trades settle; sizing must track it. (Confirm exact request/response
+   shape when you get here — same approach as Gamma/CLOB, figure out
+   specifics in place rather than pre-planning every field.)
 5. Implement fractional Kelly: `f* = (edge / odds) * kelly_fraction`,
    applied against the live balance from step 4
    (use 0.25-0.5 fractional Kelly, never full Kelly — full Kelly assumes
@@ -174,10 +213,14 @@ capital at risk so far.
 2. Build three views minimum: current positions, running PnL, model
    probability vs. market price per tracked fixture (this third one is
    the most important — it's your calibration story)
-3. Wire it to read from the same SQLite DB Day 2/5 are writing to
-   (poll/refresh every 30-60s, don't overbuild real-time infra here)
+3. Wire positions/PnL to Polymarket's Data API (positions + activity
+   endpoints) rather than only your own execution logs — it's Polymarket's
+   own on-chain record, so it can't drift out of sync with reality the way
+   a self-maintained log could. Wire the model-vs-market chart to your
+   SQLite DB from Day 2/5 (poll/refresh every 30-60s, don't overbuild
+   real-time infra here)
    - ✅ Checkpoint: dashboard reflects a position change within a minute
-     of it happening in the DB
+     of it happening
 
 **End of day:** a live, glanceable view of the whole system.
 
@@ -209,6 +252,49 @@ calculation (Day 4) into a small C++ module called from Python via
 line item matching Xantium's stated stack — but it's explicitly optional:
 per the "if you fall behind" priority order above, this comes after
 everything else, including the dashboard.
+
+---
+
+## Future extension — convergence trading (early exit)
+
+The base system (Day 4-5) is **value betting held to resolution**: find a
+market where `model_probability` differs from `market_implied_price`, take
+the +EV side, size with Kelly, and let settlement pay out. Profit is only
+realized when the market resolves.
+
+A natural extension is to also **sell before resolution** — exit a position
+when the price converges toward your model's fair value, capturing the edge
+early and freeing capital for the next signal instead of locking it up
+until the match/tournament ends. This is trading the *price move*, not just
+the settlement.
+
+What it would take (don't build this into the base engine — it's opt-in):
+
+1. **Exit logic in the signal generator (Day 4).** Alongside "enter when
+   edge > threshold", add "exit when price has moved to within X of model
+   fair value" (take-profit) and/or a stop. This means the generator must
+   evaluate *open positions*, not just fresh markets.
+2. **Sell orders in the execution engine (Day 5).** Currently we only
+   place entry orders; this needs the symmetric sell path (sell shares
+   back into the CLOB book), plus round-trip PnL accounting (entry price →
+   exit price, minus spread/fees on both sides) rather than
+   entry-vs-settlement.
+3. **A timing view.** Buy-and-hold only needs a probability estimate;
+   convergence trading also needs a view on *when* the market corrects,
+   which is a harder prediction. Realistically this wants either a
+   live-updating model input (in-play results, injuries, lineup news) or a
+   simple heuristic (e.g. exit N days before kickoff when liquidity/pricing
+   tightens), otherwise there's no principled sell trigger.
+
+Risk-logic caveat: the fractional-Kelly and exposure caps still apply, but
+round-trips change the exposure picture (positions turn over faster), so
+re-check the per-market and total caps against realized turnover if this is
+built. The drawdown circuit breaker stays as-is.
+
+Sequencing: this comes *after* a working buy-and-hold loop is validated
+end-to-end (Day 7). Trying to build exit/timing logic before the base
+value-betting loop is proven just adds a second unvalidated layer on top of
+an unvalidated one.
 
 ---
 

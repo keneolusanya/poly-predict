@@ -37,23 +37,33 @@ if __name__ == "__main__":
         sys.exit(1)
 
     result = snapshot(sys.argv[1])
+    # The v2 client returns plain dicts (not objects): get_midpoint ->
+    # {'mid': str}, get_price -> {'price': str}. Unwrap the single value, and
+    # note every price/size comes back as a STRING, so float() before math.
     print(f"Token:     {result['token_id']}")
-    print(f"Midpoint:  {result['midpoint']}")
-    print(f"Buy price: {result['buy_price']}")
-    print(f"Sell price:{result['sell_price']}")
+    print(f"Midpoint:  {result['midpoint']['mid']}")
+    print(f"Buy price: {result['buy_price']['price']}")
+    print(f"Sell price:{result['sell_price']['price']}")
 
+    # get_order_book -> dict with 'bids'/'asks' as lists of {'price','size'}
+    # dicts. Don't assume ordering: the best bid is the highest-priced bid and
+    # the best ask the lowest-priced ask, so pick them explicitly.
     book = result["book"]
-    print("\nTop of book:")
-    if getattr(book, "bids", None):
-        print(f"  Best bid: {book.bids[0].price} x {book.bids[0].size}")
-    if getattr(book, "asks", None):
-        print(f"  Best ask: {book.asks[0].price} x {book.asks[0].size}")
+    bids, asks = book["bids"], book["asks"]
+    best_bid = max(bids, key=lambda o: float(o["price"])) if bids else None
+    best_ask = min(asks, key=lambda o: float(o["price"])) if asks else None
 
-    # Sanity check against the known v1-client ghost-book bug: if midpoint
-    # looks reasonable (not exactly 0.5 or NaN) but best bid/ask are 0.01/0.99,
-    # something's wrong with the feed, not the market.
-    if book.bids and book.asks:
-        if float(book.bids[0].price) <= 0.01 and float(book.asks[0].price) >= 0.99:
+    print("\nTop of book:")
+    if best_bid:
+        print(f"  Best bid: {(float(best_bid['price']) * 100) :.1f} cents x {best_bid['size']}")
+    if best_ask:
+        print(f"  Best ask: {(float(best_ask['price']) * 100) :.1f} cents x {best_ask['size']}")
+
+    # Sanity check against the known v1-client ghost-book bug: a real market
+    # has a tight inside spread. If the BEST bid/ask are pinned at the
+    # 0.01/0.99 extremes, the book is empty/stale, not a real two-sided market.
+    if best_bid and best_ask:
+        if float(best_bid["price"]) <= 0.01 and float(best_ask["price"]) >= 0.99:
             print("\n[WARNING] Book looks like a ghost/stale snapshot "
                   "(0.01/0.99 spread). Cross-check against get_price() "
                   "before trusting this for signal generation.")
