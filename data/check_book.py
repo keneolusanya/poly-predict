@@ -10,24 +10,74 @@ Run: python data/check_book.py <token_id>
 Get a token_id from data/football_markets.json (produced by discover_markets.py)
 """
 import sys
+from datetime import datetime, timezone
 from py_clob_client_v2 import ClobClient
+from py_clob_client_v2.exceptions import PolyApiException
 
 HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 
 
+_client: ClobClient | None = None
+
+
 def get_readonly_client() -> ClobClient:
-    return ClobClient(host=HOST, chain_id=CHAIN_ID)
+    """Return a shared read-only client, building it once and reusing it.
+
+    The poller calls snapshot() repeatedly; rebuilding a client every call is
+    wasteful, so we cache one at module level (lazily, on first use)."""
+    global _client
+    if _client is None:
+        _client = ClobClient(host=HOST, chain_id=CHAIN_ID)
+    return _client
+
+
+def _best(levels: list[dict], extreme) -> dict | None:
+    """Best order on one side of the book, or None if that side is empty.
+    extreme=max for bids (highest price), min for asks (lowest price)."""
+    return extreme(levels, key=lambda o: float(o["price"])) if levels else None
 
 
 def snapshot(token_id: str) -> dict:
-    client = get_readonly_client()
+    """One order-book snapshot, flattened to storable numeric fields.
+
+    All price fields derive from a single get_order_book call, so they share
+    one instant. The client returns prices/sizes as strings; we convert to
+    float here so the DB and model get numbers straight away. Any price field
+    is None if that side of the book is empty.
+
+    The dict also carries `orderbook_missing` — a transient flag (NOT a stored
+    column; insert_snapshot ignores it) that is True only when the API reports
+    no orderbook exists (404), i.e. the market has resolved. This lets the
+    poller tell a genuinely-resolved market apart from one that just happens to
+    have an empty/one-sided book right now, and drop only the former.
+    """
+    captured_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    orderbook_missing = False
+    try:
+        book = get_readonly_client().get_order_book(token_id)
+    except PolyApiException as e:
+        # 404 = "no orderbook exists" — the market has resolved (or never had a
+        # book). Don't let one dead market crash a long poller run; flag it and
+        # treat it as an empty book so all price fields come out None.
+        if getattr(e, "status_code", None) == 404:
+            orderbook_missing = True
+            book = {"bids": [], "asks": []}
+        else:
+            raise
+    best_bid = _best(book["bids"], max)
+    best_ask = _best(book["asks"], min)
+    bid = float(best_bid["price"]) if best_bid else None
+    ask = float(best_ask["price"]) if best_ask else None
     return {
+        "orderbook_missing": orderbook_missing,
         "token_id": token_id,
-        "midpoint": client.get_midpoint(token_id),
-        "buy_price": client.get_price(token_id, side="BUY"),
-        "sell_price": client.get_price(token_id, side="SELL"),
-        "book": client.get_order_book(token_id),
+        "captured_at": captured_at,
+        "best_bid": bid,
+        "best_ask": ask,
+        "bid_size": float(best_bid["size"]) if best_bid else None,
+        "ask_size": float(best_ask["size"]) if best_ask else None,
+        "midpoint": (bid + ask) / 2 if bid is not None and ask is not None else None,
     }
 
 
@@ -36,34 +86,25 @@ if __name__ == "__main__":
         print("Usage: python data/check_book.py <token_id>")
         sys.exit(1)
 
-    result = snapshot(sys.argv[1])
-    # The v2 client returns plain dicts (not objects): get_midpoint ->
-    # {'mid': str}, get_price -> {'price': str}. Unwrap the single value, and
-    # note every price/size comes back as a STRING, so float() before math.
-    print(f"Token:     {result['token_id']}")
-    print(f"Midpoint:  {result['midpoint']['mid']}")
-    print(f"Buy price: {result['buy_price']['price']}")
-    print(f"Sell price:{result['sell_price']['price']}")
-
-    # get_order_book -> dict with 'bids'/'asks' as lists of {'price','size'}
-    # dicts. Don't assume ordering: the best bid is the highest-priced bid and
-    # the best ask the lowest-priced ask, so pick them explicitly.
-    book = result["book"]
-    bids, asks = book["bids"], book["asks"]
-    best_bid = max(bids, key=lambda o: float(o["price"])) if bids else None
-    best_ask = min(asks, key=lambda o: float(o["price"])) if asks else None
+    s = snapshot(sys.argv[1])
+    # snapshot() now returns flat floats (best_bid/ask, sizes, midpoint) plus a
+    # capture timestamp — the same shape stored in the DB by the Day-2 poller.
+    print(f"Token:     {s['token_id']}")
+    print(f"Captured:  {s['captured_at']}")
+    print(f"Midpoint:  {s['midpoint']}")
 
     print("\nTop of book:")
-    if best_bid:
-        print(f"  Best bid: {(float(best_bid['price']) * 100) :.1f} cents x {best_bid['size']}")
-    if best_ask:
-        print(f"  Best ask: {(float(best_ask['price']) * 100) :.1f} cents x {best_ask['size']}")
+    if s["best_bid"] is None and s["best_ask"] is None:
+        print("  (no orderbook — market resolved, or has no liquidity)")
+    if s["best_bid"] is not None:
+        print(f"  Best bid: {s['best_bid'] * 100:.1f} cents x {s['bid_size']}")
+    if s["best_ask"] is not None:
+        print(f"  Best ask: {s['best_ask'] * 100:.1f} cents x {s['ask_size']}")
 
-    # Sanity check against the known v1-client ghost-book bug: a real market
-    # has a tight inside spread. If the BEST bid/ask are pinned at the
-    # 0.01/0.99 extremes, the book is empty/stale, not a real two-sided market.
-    if best_bid and best_ask:
-        if float(best_bid["price"]) <= 0.01 and float(best_ask["price"]) >= 0.99:
+    # Ghost/stale-book sanity check (the known v1 bug): a real market has a
+    # tight inside spread. Best bid/ask pinned at the 0.01/0.99 extremes means
+    # the book is empty/stale, not a real two-sided market.
+    if s["best_bid"] is not None and s["best_ask"] is not None:
+        if s["best_bid"] <= 0.01 and s["best_ask"] >= 0.99:
             print("\n[WARNING] Book looks like a ghost/stale snapshot "
-                  "(0.01/0.99 spread). Cross-check against get_price() "
-                  "before trusting this for signal generation.")
+                  "(0.01/0.99 spread) — don't trust it for signal generation.")

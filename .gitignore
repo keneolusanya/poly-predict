@@ -12,6 +12,9 @@ env/
 
 # Databases — order book snapshots, positions, trade log (local data, not code)
 *.db
+# WAL-mode sidecar files
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 

@@ -80,6 +80,27 @@ No private key touched yet.
      identically (a sign the poller is failing silently and returning
      cached data)
 
+> **Discovery refresh cadence (design note — build when going continuous, not now).**
+> Discovery and polling run on two different clocks: **prices** change
+> second-to-second (poller, 60s), but the **market universe** changes only
+> hourly/daily (new fixtures listed as the bracket fills in; markets resolve
+> after each match). So `discover_markets.py` should re-run on a *slow*
+> cadence, not the poll interval.
+> - **For now: manual.** Re-run `discover_markets.py` before a polling
+>   session. Matches the human-in-the-loop ethos; don't build a scheduler yet.
+> - **When continuous (Day 7 concern):** decouple them — a scheduled
+>   discovery job (every few hours) rewrites `football_markets.json`, and the
+>   poller *reloads* its token list on an interval (~30–60 min) so newly-listed
+>   markets enter the rotation without a restart. Discovery already filters out
+>   resolved markets, and the poller's own drop-logic handles ones that resolve
+>   *between* refreshes.
+> - **Downstream implications:** the poller currently calls `load_tokens()`
+>   once at startup, so a running poller won't see new markets until it reloads
+>   or restarts. DB continuity is safe (snapshots key on stable `token_id`).
+>   `football_markets.json` is a regenerated cache (gitignored), safe to
+>   overwrite. Day-4 signal coverage depends on discovery freshness — a stale
+>   list silently misses newly-listed fixtures.
+
 ### 2b. Historical results for model fitting — World Cup scope
 1. Use the `martj42/international_results` GitHub repo (`results.csv`) —
    free, no API key, actively maintained through the current tournament.

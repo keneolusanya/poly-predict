@@ -133,6 +133,13 @@ def extract_markets(events: list[dict]) -> list[dict]:
     rows = []
     for ev in events:
         for m in ev.get("markets", []):
+            # Event-level closed=False does NOT mean every market inside is
+            # live. Individual outcomes resolve as the tournament progresses
+            # (a team gets eliminated -> "Will X reach the QF?" resolves No),
+            # and a resolved market has no orderbook — querying it 404s. Keep
+            # only markets that are themselves still tradeable.
+            if m.get("closed") or m.get("active") is not True:
+                continue
             token_ids_raw = m.get("clobTokenIds")
             outcomes_raw = m.get("outcomes")
             try:
